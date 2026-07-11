@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>JavaScript Plinko!</title>
+    <script type="module">
+      import * as vmath from "./src/vmath.js";
+      import { PrimitiveCanvas } from "./src/primitivecanvas.js";
+      import { GameEngine } from "./src/gameengine.js";
+      import { LazyAudioMixer } from "./src/lazyaudiomixer.js";
+      import { SpatialMap2D, SpatialEntity2D } from "./src/spatial-map.js";
+
+      class PlinkoEntity extends SpatialEntity2D {
+        constructor(Type,x = 0,y = 0,vx = 0,vy = 0,r = 0.5,m = 5) {
+          super(Type,x,y,vx,vy,r,m);
+          SpatialEntity2D.getData(this).LastPositionDelta = 0;
+          SpatialEntity2D.getData(this).OldPosition = [new vmath.Vector2D(x,y)];
+        }
+        lastUpdate() { return SpatialEntity2D.getData(this).LastUpdate; }
+        oldPosition() { return SpatialEntity2D.getData(this).OldPosition; }
+
+        update(DeltaSecs,AccumulatedForces) {
+          SpatialEntity2D.getData(this).LastPositionDelta += DeltaSecs;
+          if (SpatialEntity2D.getData(this).LastPositionDelta >= 0.02) {
+            SpatialEntity2D.getData(this).OldPosition.push(this.position().clone());
+            SpatialEntity2D.getData(this).LastPositionDelta = 0;
+          }
+          SpatialEntity2D.getData(this).OldPosition = SpatialEntity2D.getData(this).OldPosition.slice(-20);
+          super.update(DeltaSecs,AccumulatedForces);
+        }
+      }
+
+      class ScoreEntity extends PlinkoEntity {
+        constructor(txt,x = 0,y = 0) {
+          super("Score",x,y,0,-15);
+          SpatialEntity2D.getData(this).LastUpdate = 0;
+          SpatialEntity2D.getData(this).Text = txt;
+        }
+        text() { return SpatialEntity2D.getData(this).Text; }
+        update(DeltaSecs,AccumulatedForces) {
+          SpatialEntity2D.getData(this).LastUpdate += DeltaSecs;
+          super.update(DeltaSecs,AccumulatedForces);
+        }
+      }
+
+      class PegAnim extends PlinkoEntity {
+        constructor(x = 0,y = 0) {
+          super("PegAnim",x,y,0,0);
+          SpatialEntity2D.getData(this).LastUpdate = 0;
+        }
+        update(DeltaSecs,AccumulatedForces) {
+          SpatialEntity2D.getData(this).LastUpdate += DeltaSecs;
+          this.setRadius(this.radius() + 0.5);
+          super.update(DeltaSecs,AccumulatedForces);
+        }
+      }
+
+      class MyGame extends GameEngine {
+        #Data;
+        constructor(Parent,Width,Height,FPS = 60) {
+          super(Parent,Width,Height,FPS);
+          this.#Data = {
+            Mixer: new LazyAudioMixer(),                              //Audio Mixer DUH!
+            Music: false,                                             //Have we started music on user input?
+            SpatialParition: new SpatialMap2D(0,0,Width,Height,25),   //Grid subdivision of the "World" and lookup for "nearby" objects
+            BackgroundCanvas: new PrimitiveCanvas(null,Width,Height), //All Static entities (besides text) rendered once to just copy from instead of redraw every frame
+            Entities: {
+              Static: [],                                             //Static Entities (pegs, walls)
+              Dynamic: [],                                            //Dynamic Entities (balls, stuff with collision responses)
+              Text: [],                                               //Animated score text (non-collidable)
+              Animation: [],                                          //Peg hit expanding rings (non-collidable)
+            },
+            Gravity: new vmath.Vector2D(0,600),                       //World Gravity!
+            Score: 0,                                                 //Your score!
+            Scale: {x: 1 , y: 1 },
+            Options: {
+              sfx1: document.getElementById('sfx1'),
+              bt1: document.getElementById('bt1'),
+              ss1: document.getElementById('ss1'),
+              pr1: document.getElementById('pr1'),
+              sl1: document.getElementById('sl1'),
+            }
+          }
+
+          //Scoring pocket gradients for the background render
+          this.#Data.gradientA = this.getContext("2d").createLinearGradient(0, 16*40, 0, 16*40 + 150); 
+          this.#Data.gradientB = this.getContext("2d").createLinearGradient(0, 16*40, 0, 16*40 + 150);
+          this.#Data.gradientA.addColorStop(0, "#5949d6");
+          this.#Data.gradientA.addColorStop(1, "#1ce8ff");
+          this.#Data.gradientB.addColorStop(0, "#5949d6");
+          this.#Data.gradientB.addColorStop(1, "#fe00e2");
+
+          //Load up Sounds/Music
+          this.mixer().loadAudioBuffer("music","./assets/Ambient.mp3");
+          this.mixer().loadAudioBuffer("click","./assets/button_click.mp3");
+          this.mixer().loadAudioBuffer("bonk","./assets/bonk.mp3");
+          this.mixer().loadAudioBuffer("drop","./assets/drop.mp3");
+          this.mixer().loadAudioBuffer("mult","./assets/mult.mp3");
+          this.mixer().loadAudioBuffer("none","./assets/score-none.mp3");
+          this.mixer().loadAudioBuffer("low","./assets/score-low.mp3");
+          this.mixer().loadAudioBuffer("mid","./assets/score-mid.mp3");
+          this.mixer().loadAudioBuffer("high","./assets/score-high.mp3");
+          this.mixer().loadAudioBuffer("jackpot","./assets/score-jackpot.mp3");
+          this.mixer().masterVolume(0.3);
+
+          //Sound events! (Mainly useful if you wanna cycle thru music tracks instead of looping a singular track)
+          //calls soundEvent((str)alias,(LazyAudioSound)Sound)
+          this.mixer().connect(this,this.soundEndEvent);
+
+          this.getContext("2d").scale(this.#Data.Scale.x,this.#Data.Scale.y);
+          this.#Data.BackgroundCanvas.getContext("2d").scale(this.#Data.Scale.x,this.#Data.Scale.y);
+
+          //Generate Pegs
+          for (let y = 2; y <= 14; y++) { for (let x = 1; x <= 9; x++) { if (y % 2 != 0 || (y % 2 == 0 && x < 9)) { this.AddPeg((y % 2 == 0 ? x + 0.55 : x + 0.05) * 50,y * 40); } } }
+
+          //Generate staggered "Walls"
+          for (let y = 1; y < 14; y++) {
+            if (y % 2 !== 0) {
+              this.AddLineSeg(5,0,y * 40,0.5 * 50,(y+1) * 40)
+              this.AddLineSeg(5,10 * 50,y * 40,9.5 * 50,(y+1) * 40)
+            }
+            else {
+              this.AddLineSeg(5,0.5 * 50,y*40,0,(y+1)*40)
+              this.AddLineSeg(5,9.5 * 50,y * 40,10 * 50,(y+1) * 40)
+            }
+          }
+          //Generate Walls for scoring areas
+          for (let x = 0; x <= 9; x++) {  this.AddLineSeg(5,(x + 0.5) * 50,(x == 0 || x == 9 ? 14 : 16)*40,(x + 0.5)*50,18*40) }
+
+          //Draw the image once of the static world
+          this.renderBackground();
+        }
+
+        //SoundEvent callback! Maybe not looping music? See when one ends and play another?
+        soundEndEvent(alias,Sound) { }
+
+        spatialMap() { return this.#Data.SpatialParition; }
+        entities() { return this.#Data.Entities; }
+        mixer() { return this.#Data.Mixer; }
+        play(alias,vol,loop) { 
+          if (loop || this.#Data.Options.sfx1.checked) { this.mixer().play(alias,vol,loop); }
+        }
+
+        AddPeg(x,y) {
+          let Entity = new PlinkoEntity("Peg",x,y,0,0,5);
+          Entity._Restitution = (vmath.randInt(1,10) == 10 ? 1.4 : 0.4);
+          Entity._Color = (Entity._Restitution > 1 ? "green" : "#20b9e4");
+          this.entities().Static.push(Entity);
+          this.spatialMap().spatialInsert(Entity,Entity.bounds());
+        }
+
+        AddBall(x,y) {
+          let Entity = new PlinkoEntity("Ball",x,y,0,0,15);
+          Entity._Color = vmath.getRandomColor();
+          this.entities().Dynamic.push(Entity);
+          this.spatialMap().spatialInsert(Entity,Entity.bounds());
+        }
+
+        AddScore(txt,x,y) {
+          if (this.#Data.Options.ss1.checked) {
+            let Entity = new ScoreEntity(txt,x,y);
+            Entity._Color = "#FFFFFF";
+            this.entities().Text.push(Entity);
+          }
+        }
+
+        AddPegAnim(x,y) {
+          if (this.#Data.Options.pr1.checked) {
+            let Entity = new PegAnim(x,y);
+            Entity._Color = "rgba(30,185,228,0.3)";
+            this.entities().Animation.push(Entity);
+          }
+        }
+
+        AddLineSeg(r,x1,y1,x2,y2) {
+          let ls = new PlinkoEntity("Line",x1,y1,0,0,r,0);
+          ls._Position2 = new vmath.Vector2D(x2,y2);
+          ls._Color = "#e6edd7";
+          this.entities().Static.push(ls);
+          this.SPInsLS(ls);
+        }
+
+        SPDelLS(ls) {
+          this.spatialMap().spatialDelete(ls,[ls.position().x - ls.radius(),ls.position().y - ls.radius(),ls.position().x + ls.radius(),ls.position().y + ls.radius()]);
+          this.spatialMap().spatialDelete(ls,[ls._Position2.x - ls.radius(),ls._Position2.y - ls.radius(),ls._Position2.x + ls.radius(),ls._Position2.y + ls.radius()]);
+          let points = this.spatialMap().lineSegmentToGridIntersectionPoints([ls.position().x,ls.position().y,ls._Position2.x,ls._Position2.y]);
+          points.forEach((point) => { this.spatialMap().spatialDelete(ls,[point[0] - ls.radius(),point[1] - ls.radius(),point[0] + ls.radius(),point[1] + ls.radius()]); });
+        }
+
+        SPInsLS(ls) {
+          this.spatialMap().spatialInsert(ls,[ls.position().x - ls.radius(),ls.position().y - ls.radius(),ls.position().x + ls.radius(),ls.position().y + ls.radius()]);
+          this.spatialMap().spatialInsert(ls,[ls._Position2.x - ls.radius(),ls._Position2.y - ls.radius(),ls._Position2.x + ls.radius(),ls._Position2.y + ls.radius()]);
+          let points = this.spatialMap().lineSegmentToGridIntersectionPoints([ls.position().x,ls.position().y,ls._Position2.x,ls._Position2.y]);
+          points.forEach((point) => { this.spatialMap().spatialInsert(ls,[point[0] - ls.radius(),point[1] - ls.radius(),point[0] + ls.radius(),point[1] + ls.radius()]); });
+        }
+
+        handleEvent(evt) {
+          if (evt.type == 'userinput') {
+            let e = evt.detail.jsEvent;
+
+            //Find relative (x,y) from the position of the canvas on the page
+            let rect = e.target.getBoundingClientRect() , x = (e.clientX - rect.left) / this.#Data.Scale.x , y = (e.clientY - rect.top) / this.#Data.Scale.y;
+
+            if (e.type == 'pointerup') { //Seems sounds can only be played from a pointerup event on mobile (user initted input, pointerdown is too soon...)
+              if (!this.#Data.Music) { 
+                this.play("music",1,true);
+                this.#Data.Music = true;
+                document.getElementById('ms1').checked = true;
+              }
+              this.play("drop",0.5);
+              this.AddBall(x,y);
+            }
+            /* Crazy fast launcher on mouse move... STRESS TESTER! */
+            else if (e.type == 'pointermove' && e.buttons && this.#Data.Options.sl1.checked) {
+              this.play("drop",0.5);
+              this.AddBall(x,y);
+            }
+          }
+        }
+
+        //Public overloaded functions
+        onPause() { this.mixer().mute(true); }
+        onRun() { this.mixer().mute(false); }
+
+        update(DeltaTime) { 
+          let DeltaSecs = DeltaTime / 1000 , SimUpdates = 8 , SimSecs = DeltaSecs / SimUpdates;
+          let shouldScore = "false", shouldBonk = false;
+
+          this.entities().Text.forEach(score => { score.update(DeltaSecs); });
+          this.entities().Animation.forEach(peg => { peg.update(DeltaSecs); });
+
+          //Divide this frame update into a series of smaller framesteps. The more substeps the more accurate the simulation at the expense of CPU cycles.
+          for (let i = 0; i < SimUpdates; i++) {
+            //Update Positions
+            this.entities().Dynamic.forEach((Entity) => {
+              if (Entity.type() == "Ball") {
+                this.spatialMap().spatialDelete(Entity,Entity.bounds());
+                //Update position based on velocity (Accumulative forces are gravity and 20% of objects current vel negated to simulate resistance through air)
+                Entity.update(SimSecs,this.#Data.Gravity.cAdd(Entity.velocity().neg().multScalar(0.2))); 
+                //Add back into map after positional changes
+                this.spatialMap().spatialInsert(Entity,Entity.bounds());
+              }
+            });
+
+            //Collision Resolver & Expunge of off-screen entities
+            this.entities().Dynamic.reduceRight((len,A,i) => {
+              if (A.type() === "Ball") {
+                //Get a Set() of all entities nearby EXCLUDING ourself...
+                let Colliders = Array.from(this.spatialMap().spatialNearBy(A,A.bounds()));
+                for (let [CIndex,B] of Colliders.entries()) {
+                  //Avoid double solve by only allowing the lower index to resolve, No point in testing B-A if we already tested A-B.
+                  if (B.type() === "Ball" && i < this.entities().Dynamic.indexOf(B))  {
+                    let Difference = B.position().cSub(A.position()) , Radii = A.radius() + B.radius();
+                    if (Difference.magSq() < Math.pow(Radii,2)) {
+                      //The actual distance difference (they're already overlapping) minus the sum of their radii gives how much they're overlapping. Divided by two since each will be offset equally to be just "touching".
+                      let Overlap = (Difference.mag() - Radii) / 2 , OverlapDiff = A.position().cSub(B.position()).multScalar(Overlap).divScalar(Radii);
+                      //Displace objects by half the overlap (subtract half the distance from one, add half the distance to the other)
+                      this.spatialMap().spatialDelete(A,A.bounds()); //Remove from map at current location
+                      A.position().sub(OverlapDiff);
+                      this.spatialMap().spatialInsert(A,A.bounds()); //Re-insert to map at new location
+
+                      this.spatialMap().spatialDelete(B,B.bounds()); //Remove from map at current location
+                      B.position().add(OverlapDiff);
+                      this.spatialMap().spatialInsert(B,B.bounds()); //Re-insert to map at new location
+
+                      //Change Velocities due to collision
+                      let Normal = Difference.cDivScalar(Radii) , scalar = A.velocity().dot(Normal) - B.velocity().dot(Normal);
+                      A.velocity().sub(Normal.cMultScalar(scalar));
+                      B.velocity().add(Normal.cMultScalar(scalar));
+                    }
+                  }  
+                  else if (B.type() === "Peg")  {
+                    let Difference = B.position().cSub(A.position()) , Radii = A.radius() + B.radius();
+                    if (Difference.magSq() < Math.pow(Radii,2)) {
+                      //The actual distance difference (they're already overlapping) minus the sum of their radii gives how much they're overlapping. Divided by two since each will be offset equally to be just "touching".
+                      let Overlap = (Difference.mag() - Radii) , OverlapDiff = A.position().cSub(B.position()).multScalar(Overlap).divScalar(Radii);
+                      this.spatialMap().spatialDelete(A,A.bounds()); //Remove from map at current location
+                      A.position().sub(OverlapDiff);
+                      this.spatialMap().spatialInsert(A,A.bounds()); //Re-insert to map at new location
+
+                      //Change Velocities due to collision
+                      let Normal = Difference.cDivScalar(Radii);
+                      if (Normal.dot(A.velocity()) >= 0) {
+                        let rvel = A.velocity().clone();
+                        A.velocity().add(Normal.cMultScalar(-(1 + B._Restitution) * Normal.dot(A.velocity()))); 
+                        rvel.sub(A.velocity());
+                        //Ensure the "relative" velocity change (before-after) is large enough to "bounce" not "rest" and score.
+                        if (rvel.magSq() >= 800) {
+                          this.AddPegAnim(B.position().x,B.position().y);
+                          this.AddScore("+30",A.position().x,A.position().y);
+                          this.#Data.Score += 30;
+                          shouldBonk = true; 
+                        }
+                      }
+                    }
+                  }  
+                  else if (B.type() == "Line") {
+                    let LSDifference = B._Position2.cSub(B.position());
+                    let t = Math.max(0,Math.min(LSDifference.magSq(),LSDifference.x * (A.position().x - B.position().x) + LSDifference.y * (A.position().y - B.position().y))) / LSDifference.magSq();
+                    let CP = new vmath.Vector2D(B.position().x + t * LSDifference.x,B.position().y + t * LSDifference.y);
+                    let CPMass = A.mass() * 0.8; //80% of the objects mass, so it absorbs more energy (NON-Elastic, energy loss, IE deformation, compression, whatever...)
+                    let Difference = CP.cSub(A.position()) , Radii = A.radius() + B.radius();
+
+                    if (Difference.magSq() < Math.pow(Radii,2)) {
+                      let Overlap = (Difference.mag() - Radii) , OverlapDiff = A.position().cSub(CP).multScalar(Overlap).divScalar(Radii);              
+                      this.spatialMap().spatialDelete(A,A.bounds()); //Remove from map at current location
+                      A.position().sub(OverlapDiff);
+                      this.spatialMap().spatialInsert(A,A.bounds()); //Re-insert to map at new location
+
+                      //Find the "Normal" Direction of the collision (line between centers) and the perpendicular direction (think "T" the horizontal portion is the "perpendicular" of the vertical portion. We need this so it's like a reflection off a mirror)
+                      let Normal = Difference.cDivScalar(Radii);
+                      let Tangent = Normal.perp();
+                      let DpNorm1 = A.velocity().dot(Normal) , DpNorm2 = A.velocity().clone().multScalar(0.8).neg().dot(Normal);
+                      let DpTan1 = A.velocity().dot(Tangent) , DpTan2 = A.velocity().clone().multScalar(0.8).neg().dot(Tangent);
+
+                      //Below steps are Conservation of Energy, Elastic Collision Response
+                      let m1 = (DpNorm1 * (A.mass() - CPMass) + 2 * CPMass * DpNorm2) / (A.mass() + CPMass);
+                      let m2 = (DpNorm2 * (CPMass - A.mass()) + 2 * A.mass() * DpNorm1) / (A.mass() + CPMass);
+
+                      //Change Velocities due to collision
+                      let rvel = A.velocity().clone();
+                      A.velocity().x = Tangent.x * DpTan1 + Normal.x * m1;
+                      A.velocity().y = Tangent.y * DpTan1 + Normal.y * m1;
+
+                      rvel.sub(A.velocity());
+                      //Ensure the "relative" velocity change (before-after) is large enough to "bounce" not "rest" and score.
+                      if (rvel.magSq() >= 800) {
+                        shouldBonk = true;
+                      }
+                    }
+                  }
+                }
+              }
+              //If entity is below screen:
+              if (A.position().y > this.height) { 
+                //Delete entity
+                let ScoreTable = [100,500,1000,0,10000,0,1000,500,100], pc = Math.floor(A.position().x / this.width * 9)
+                this.AddScore("+" + (ScoreTable[pc] || 0),A.position().x,this.height - 10);
+                this.#Data.Score += ScoreTable[pc] || 0;
+                this.spatialMap().spatialDelete(A,A.bounds()); //Remove from map at current location
+                this.entities().Dynamic.splice(i,1);
+                shouldScore = ScoreTable[pc];
+              }
+            },this.entities().Dynamic[this.entities().Dynamic.length - 1]);
+          }
+
+          //If lifespan is beyond limit... expunge entitiy
+          this.entities().Text.reduceRight((Total,score,Index) => { if (score.lastUpdate() >= 1.5) { this.entities().Text.splice(Index,1); } },this.entities().Text[this.entities().Text.length -1]);
+          this.entities().Animation.reduceRight((Total,peg,Index) => { if (peg.lastUpdate() >= 0.5) { this.entities().Animation.splice(Index,1); } },this.entities().Animation[this.entities().Animation.length -1]);
+          
+          if (!isNaN(shouldScore)) {
+            if (shouldScore == 10000) { this.play("jackpot"); }
+            else if (shouldScore == 1000) { this.play("high"); }
+            else if (shouldScore == 500) { this.play("mid"); }
+            else if (shouldScore == 100) { this.play("low"); }
+            else if (shouldScore == 0) { this.play("none"); }
+          }
+          if (shouldBonk) { this.play("bonk",0.5); }
+        }
+
+        renderBackground() { 
+          let cvs = this.#Data.BackgroundCanvas;
+          cvs.drawClear({fillStyle: "#080350"});
+          for (let x = 0; x < 9; x++) { cvs.drawRect({fillStyle:(x % 2 == 0 ? this.#Data.gradientA : this.#Data.gradientB),lineWidth:1},"f",(x + 0.5) * 50,16*40,50,80) }
+          this.entities().Static.forEach(entity => {
+            if (entity.type() == "Peg") { cvs.drawCircle({ fillStyle: entity._Color, lineWidth: 1, strokeStyle: "black", shadowBlur: 1, shadowColor: (entity._Color == "green" ? "#013B01" : "#5C0052"), shadowOffsetX: 1, shadowOffsetY: 1 },"fs",entity.radius(),entity.position().x,entity.position().y) }
+            else if (entity.type() == "Line") { cvs.drawLine({filter: 'blur(1px)',strokeStyle:entity._Color, shadowBlur: 15,shadowColor: "magenta", lineWidth:entity.radius()*2, lineCap: 'round' },"s",entity.position().x,entity.position().y,entity._Position2.x,entity._Position2.y) }
+          });
+        }
+
+        render(DeltaTime) { 
+          this.drawCopy("p",this.#Data.BackgroundCanvas,0,0,this.width,this.height,0,0);
+          this.entities().Dynamic.forEach(entity => {
+            if (entity.type() == "Ball" && this.#Data.Options.bt1.checked) { entity.oldPosition().forEach((pos,i) => { this.drawCircle({ fillStyle: vmath.hexToRgb(entity._Color,0.2), lineWidth: 1 },"f",entity.radius() * ((i+1) / entity.oldPosition().length),pos.x,pos.y) }); } 
+            this.drawCircle({ fillStyle: entity._Color, lineWidth: 1, strokeStyle: "black" },"fs",entity.radius(),entity.position().x,entity.position().y) 
+          });
+          if (this.#Data.Options.pr1.checked) { this.entities().Animation.forEach(entity => { this.drawCircle({ strokeStyle: entity._Color, lineWidth: 2 },"s",entity.radius(),entity.position().x,entity.position().y) }); }
+          if (this.#Data.Options.ss1.checked) { this.entities().Text.forEach(score => { this.drawText({fillStyle:`rgba(255,255,255,${1 - score.lastUpdate() / 1.5})`,strokeStyle:`rgba(0,0,0,${1 - score.lastUpdate() / 1.5})`,lineWidth:1,font:"10px Sans-Serif"},"fsc",score.position().x,score.position().y,score.text()) }); }
+          this.drawText({fillStyle:"#00feff",strokeStyle:"black",lineWidth:3,font:"20px Sans-Serif"},"fs",5,5,"Score: " + this.#Data.Score.toString().replace(/(\d)(?=(\d{3})+$)/g,(a,b) => { return b + "," }) )
+          let ScoreTable = [100,500,1000,0,10000,0,1000,500,100];
+          for (let x = 0; x < 9; x++) { this.drawText({fillStyle:"white",strokeStyle:"black",lineWidth:2,font:"15px Sans-Serif"},"fsc",(x + 1) * 50,16.8*40,ScoreTable[x]); }
+        }
+      }
+      customElements.define('my-game', MyGame, { extends: "canvas" });
+
+      window.addEventListener('load',() => {
+        let game = new MyGame(document.getElementById('GameContainer'),500,700,60), 
+        mastervolume = document.getElementById('mastervolume'),
+        musicvolume = document.getElementById('musicvolume'),
+        togglemusic = document.getElementById('ms1'),
+        soundvolume = document.getElementById('soundvolume');
+
+        togglemusic.addEventListener('change',() => { 
+          if (togglemusic.checked == false) { game.mixer().sound('music').stop(); }
+          else { game.mixer().play('music',musicvolume.value,true); }
+        });
+
+        let nopen = document.querySelectorAll('.opener');
+        nopen.forEach((el) => { 
+          el.addEventListener('click',() => { 
+            let elem = document.getElementById('sidebar')
+            if (elem.style.left == 0 || parseInt(elem.style.left) < 0) { elem.style.left = "0px"; }
+            else { elem.style.left = "-210px"; } 
+          });
+        });
+        game.run();
+        mastervolume.value = game.mixer().masterVolume();
+        mastervolume.addEventListener('input',() => { game.mixer().masterVolume(mastervolume.value); })
+        musicvolume.addEventListener('input',() => { game.mixer().sound('music').volume(musicvolume.value); })
+        soundvolume.addEventListener('input',() => { game.mixer().mixVolume(soundvolume.value); })
+      });
+    </script>
+<style>
+body { background: #141418; color: #ffffff; }
+#GameContainer {
+  position: relative;
+}
+#sidebar {
+  position: absolute;
+  top:0;
+  left:-210px;
+  width: 200px;
+  background-color: #111;
+  overflow: hidden;
+  transition: 0.25s;
+}
+
+#sidebar .closebtn {
+  text-align: right;
+  font-size: 36px;
+}
+
+.settings {
+	background-color: rgb(13,13,18);
+  border: 1px solid rgb(42,42,48);
+  border-radius: 1em;
+}
+.settings .header {
+	padding-top: .75rem;
+	padding-bottom: .75rem;
+	padding-left: 1rem;
+	padding-right: 1rem;
+	border-bottom: 1px solid rgb(42,42,48);
+}
+.settings .bod {
+  display: flex;
+  flex-direction: column;
+  margin: .75rem;
+  padding: .75rem;
+	background-color: rgb(22,22,28);
+	border-radius: .75rem;
+}
+.settings .elem {
+  display: flex;
+  flex-direction: column;
+}
+
+input:where([type="checkbox"][role="switch"]) {
+  appearance: none;
+  position: relative;
+  float: right;
+  font-size: inherit;
+  width: 2em;
+  height: 1em;
+  box-sizing: content-box;
+  border: 1px solid;
+  border-radius: 1em;
+  vertical-align: text-bottom;
+  margin-left: auto;
+  color: inherit;
+  background-color: inherit;
+}
+
+input:where([type="checkbox"][role="switch"])::before {
+  content: "";
+  position: absolute;
+  float: right;
+  top: 50%;
+  left: 0;
+  transform: translate(0, -50%);
+  box-sizing: border-box;
+  width: 0.7em;
+  height: 0.7em;
+  margin: 0 0.15em;
+  border: 1px solid;
+  border-radius: 50%;
+  background: currentcolor;
+}
+
+input:where([type="checkbox"][role="switch"]):checked::before {
+  left: 1em;
+}
+input:where([type="checkbox"][role="switch"]):checked {
+  background-color: #005fca;
+}
+</style>
+  </head>
+  <body>
+    <a href="javascript:void(0)" id="nopen" class="openbtn opener">Settings</a><br>
+    <div id="GameContainer">
+      <div id="sidebar" class="settings">
+        <div class="header">Settings <span class="opener" style="float: right; cursor: default">X</span></div>
+        <div class="bod">
+          <div class="elem">
+            <div><img src="./assets/sound-max.svg" height="20"> Master </div><br>
+            <input type="range" id="mastervolume" min="0" max="1" step="0.01" value="1">
+          </div>
+          <div class="elem">
+            <div style="display:flex; flex-direction: row;"><img src="./assets/music.svg" height="20"><label for="ms1">Music</label><input type="checkbox" role="switch" id="ms1"> </div>
+            <input type="range" id="musicvolume" min="0" max="1" step="0.01" value="1">
+          </div>
+          <div class="elem">
+           <div><img src="./assets/sound-max.svg" height="20"> <label for="sfx1">Sound</label><input type="checkbox" role="switch" id="sfx1" checked> </div><br>
+            <input type="range" id="soundvolume" min="0" max="1" step="0.01" value="1">
+          </div>
+        </div>
+        <div class="bod">
+          <div class="elem"><div style="display:flex; flex-direction: row;"><label for="bt1">Ball Tail</label><input type="checkbox" role="switch" id="bt1" checked> </div></div>
+          <div class="elem"><div style="display:flex; flex-direction: row;"><label for="ss1">Score Scroll</label><input type="checkbox" role="switch" id="ss1" checked> </div></div>
+          <div class="elem"><div style="display:flex; flex-direction: row;"><label for="pr1">Peg Rings</label><input type="checkbox" role="switch" id="pr1" checked> </div></div>
+          <div class="elem"><div style="display:flex; flex-direction: row;"><label for="sl1">Super Launch</label><input type="checkbox" role="switch" id="sl1"> </div></div>
+        </div>
+      </div>
+    </div>
+    Click anywhere to spawn a ball! (Super Launch is on mousemove with a button down)<br>
+    Ball-to-Ball collisions are perfectly-elastic.<br>
+    Green pegs are extra "bouncy" (non-elastic, extra energy)<br>
+    Blue pegs and walls are absorbent (non-elastic, loss of energy)<br>
+  </body>
+</html>
