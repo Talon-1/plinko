@@ -14,7 +14,7 @@
 
   ---------------------------------------------------------------------------------------------------------*/
 
-import * as vmath from "/js/src/vmath.js";
+import * as vmath from "./vmath.js";
 
 export class SpatialMap2D {
   #Data;
